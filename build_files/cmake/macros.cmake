@@ -1146,11 +1146,20 @@ function(find_python_package
       message(STATUS "${package} found at '${PYTHON_${_upper_package}_PATH}'")
 
       if(NOT "${relative_inc_dir}" STREQUAL "")
-        set(_relative_inc_dir "${package}/${relative_inc_dir}")
+        # NumPy 2.x switched from "numpy/core/include" to "numpy/_core/include".
+        # Keep compatibility with both layouts while preserving the generic lookup
+        # for other python packages.
+        set(_relative_inc_dir_candidates "${package}/${relative_inc_dir}")
+        if("${package}" STREQUAL "numpy")
+          if("${relative_inc_dir}" STREQUAL "core/include")
+            list(APPEND _relative_inc_dir_candidates "${package}/_core/include")
+          endif()
+        endif()
+
         unset(PYTHON_${_upper_package}_INCLUDE_DIRS CACHE)
         find_path(PYTHON_${_upper_package}_INCLUDE_DIRS
           NAMES
-            "${_relative_inc_dir}"
+            ${_relative_inc_dir_candidates}
           HINTS
             "${PYTHON_LIBPATH}/"
             "${PYTHON_LIBPATH}/python${PYTHON_VERSION}/"
@@ -1167,22 +1176,36 @@ Path to python site-packages or dist-packages containing '${package}' module hea
         mark_as_advanced(PYTHON_${_upper_package}_INCLUDE_DIRS)
 
         if(NOT EXISTS "${PYTHON_${_upper_package}_INCLUDE_DIRS}")
+          string(JOIN "', '" _relative_inc_dir_candidates_str ${_relative_inc_dir_candidates})
           message(WARNING
             "Python package '${package}' include dir path could not be found in:\n"
-            "'${PYTHON_LIBPATH}/python${PYTHON_VERSION}/site-packages/${_relative_inc_dir}', "
-            "'${PYTHON_LIBPATH}/python${_PY_VER_MAJOR}/site-packages/${_relative_inc_dir}', "
-            "'${PYTHON_LIBPATH}/python${PYTHON_VERSION}/dist-packages/${_relative_inc_dir}', "
-            "'${PYTHON_LIBPATH}/python${_PY_VER_MAJOR}/dist-packages/${_relative_inc_dir}', "
-            "'${PYTHON_LIBPATH}/python${PYTHON_VERSION}/vendor-packages/${_relative_inc_dir}', "
-            "'${PYTHON_LIBPATH}/python${_PY_VER_MAJOR}/vendor-packages/${_relative_inc_dir}', "
+            "'${PYTHON_LIBPATH}/python${PYTHON_VERSION}/site-packages/{${_relative_inc_dir_candidates_str}}', "
+            "'${PYTHON_LIBPATH}/python${_PY_VER_MAJOR}/site-packages/{${_relative_inc_dir_candidates_str}}', "
+            "'${PYTHON_LIBPATH}/python${PYTHON_VERSION}/dist-packages/{${_relative_inc_dir_candidates_str}}', "
+            "'${PYTHON_LIBPATH}/python${_PY_VER_MAJOR}/dist-packages/{${_relative_inc_dir_candidates_str}}', "
+            "'${PYTHON_LIBPATH}/python${PYTHON_VERSION}/vendor-packages/{${_relative_inc_dir_candidates_str}}', "
+            "'${PYTHON_LIBPATH}/python${_PY_VER_MAJOR}/vendor-packages/{${_relative_inc_dir_candidates_str}}', "
             "\n"
             "The 'WITH_PYTHON_${_upper_package}' option will be disabled.\n"
             "The build will be usable, only add-ons that depend on this package "
             "won't be functional."
           )
+          unset(_relative_inc_dir_candidates_str)
           set(WITH_PYTHON_${_upper_package} OFF PARENT_SCOPE)
         else()
-          set(_temp "${PYTHON_${_upper_package}_INCLUDE_DIRS}/${package}/${relative_inc_dir}")
+          unset(_relative_inc_dir_selected)
+          foreach(_relative_inc_dir ${_relative_inc_dir_candidates})
+            if(EXISTS "${PYTHON_${_upper_package}_INCLUDE_DIRS}/${_relative_inc_dir}")
+              set(_relative_inc_dir_selected "${_relative_inc_dir}")
+              break()
+            endif()
+          endforeach()
+          if("${_relative_inc_dir_selected}" STREQUAL "")
+            # Should not happen after find_path, keep the fallback deterministic.
+            list(GET _relative_inc_dir_candidates 0 _relative_inc_dir_selected)
+          endif()
+
+          set(_temp "${PYTHON_${_upper_package}_INCLUDE_DIRS}/${_relative_inc_dir_selected}")
           unset(PYTHON_${_upper_package}_INCLUDE_DIRS CACHE)
           set(PYTHON_${_upper_package}_INCLUDE_DIRS "${_temp}"
               CACHE PATH "Path to the include directory of the ${package} module")
@@ -1190,7 +1213,10 @@ Path to python site-packages or dist-packages containing '${package}' module hea
           message(STATUS
             "${package} include files found at '${PYTHON_${_upper_package}_INCLUDE_DIRS}'"
           )
+          unset(_relative_inc_dir_selected)
         endif()
+
+        unset(_relative_inc_dir_candidates)
       endif()
     endif()
   endif()

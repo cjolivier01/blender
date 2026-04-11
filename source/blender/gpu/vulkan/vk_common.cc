@@ -11,6 +11,16 @@
 #include "vk_common.hh"
 
 namespace blender::gpu {
+VkImageLayout to_vk_image_layout_rendering_local_read()
+{
+#ifdef VK_KHR_dynamic_rendering_local_read
+  return VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ_KHR;
+#else
+  /* Header fallback when VK_KHR_dynamic_rendering_local_read is unavailable. */
+  return VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+#endif
+}
+
 VkImageAspectFlags to_vk_image_aspect_flag_bits(const eGPUTextureFormat format)
 {
   switch (format) {

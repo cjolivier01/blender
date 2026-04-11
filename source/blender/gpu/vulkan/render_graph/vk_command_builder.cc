@@ -650,7 +650,9 @@ void VKCommandBuilder::add_image_read_barriers(VKRenderGraph &render_graph,
       /* Has already been covered in previous barrier no need to add this one. */
       continue;
     }
-    if (within_rendering && link.vk_image_layout != VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ_KHR) {
+    if (within_rendering &&
+        link.vk_image_layout != to_vk_image_layout_rendering_local_read())
+    {
       /* Allow only local read barriers inside rendering scope */
       continue;
     }
@@ -708,7 +710,9 @@ void VKCommandBuilder::add_image_write_barriers(VKRenderGraph &render_graph,
         versioned_resource.handle);
     VKResourceBarrierState &resource_state = resource.barrier_state;
     const VkAccessFlags wait_access = resource_state.vk_access;
-    if (within_rendering && link.vk_image_layout != VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ_KHR) {
+    if (within_rendering &&
+        link.vk_image_layout != to_vk_image_layout_rendering_local_read())
+    {
       /* Allow only local read barriers inside rendering scope */
       continue;
     }
@@ -882,7 +886,7 @@ void VKCommandBuilder::LayeredImageTracker::suspend(Barrier &r_barrier, bool use
             VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
             VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
         binding.vk_image_layout,
-        use_local_read ? VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ_KHR :
+        use_local_read ? to_vk_image_layout_rendering_local_read() :
                          VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         VK_IMAGE_ASPECT_COLOR_BIT,
         binding.layer,
@@ -922,7 +926,7 @@ void VKCommandBuilder::LayeredImageTracker::resume(Barrier &r_barrier, bool use_
         VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
             VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
             VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
-        use_local_read ? VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ_KHR :
+        use_local_read ? to_vk_image_layout_rendering_local_read() :
                          VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         binding.vk_image_layout,
         VK_IMAGE_ASPECT_COLOR_BIT,

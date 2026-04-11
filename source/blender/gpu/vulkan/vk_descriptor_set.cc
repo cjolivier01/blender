@@ -161,7 +161,7 @@ void VKDescriptorSetTracker::bind_input_attachment_resource(
                VK_NULL_HANDLE,
                texture->image_view_get(resource_binding.arrayed, VKImageViewFlags::NO_SWIZZLING)
                    .vk_handle(),
-               VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ_KHR,
+               to_vk_image_layout_rendering_local_read(),
                resource_binding.location);
     access_info.images.append({texture->vk_image_handle(),
                                resource_binding.access_mask,

@@ -75,6 +75,13 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(CPACK_RPM_PACKAGE_GROUP "Amusements/Multimedia")
     set(CPACK_RPM_USER_BINARY_SPECFILE "${CMAKE_SOURCE_DIR}/build_files/package_spec/rpm/blender.spec.in")
   endif()
+
+  # DEB packages.
+  # Keep CPack's default naming scheme and let it resolve shared library dependencies.
+  set(CPACK_DEBIAN_PACKAGE_MAINTAINER "${PROJECT_VENDOR}")
+  set(CPACK_DEBIAN_PACKAGE_SECTION "graphics")
+  set(CPACK_DEBIAN_FILE_NAME "DEB-DEFAULT")
+  set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
 endif()
 
 # Mac Bundle
@@ -117,6 +124,15 @@ set(CPACK_PACKAGE_EXECUTABLES "blender-launcher" "Blender ${MAJOR_VERSION}.${MIN
 set(CPACK_CREATE_DESKTOP_LINKS "blender-launcher" "Blender ${MAJOR_VERSION}.${MINOR_VERSION}")
 
 include(CPack)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_custom_target(package_deb
+    COMMAND "${CMAKE_CPACK_COMMAND}" -G DEB --config "${CPACK_OUTPUT_CONFIG_FILE}" -B "${CMAKE_BINARY_DIR}/release"
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "Building DEB package with CPack"
+    VERBATIM
+  )
+endif()
 
 # Target for build_archive.py script, to automatically pass along
 # version, revision, platform, build directory

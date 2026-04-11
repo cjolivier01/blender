@@ -1,1 +1,94 @@
-make GNUmakefile  BUILD_CMAKE_ARGS="-DPYTHON_LIBPATH=$CONDA_PREFIX/lib -DPYTHON_LIBRARY=$CONDA_PREFIX/lib/libpython3.so -DPYTHON_INCLUDE_DIR=$CONDA_PREFIX/include/python3.11" lite
+#!/usr/bin/env bash
+set -euo pipefail
+
+if ! command -v python >/dev/null 2>&1; then
+  echo "python not found in PATH"
+  exit 1
+fi
+
+if [[ -z "${CONDA_PREFIX:-}" ]]; then
+  echo "CONDA_PREFIX is not set. Activate your conda env first."
+  exit 1
+fi
+
+py_info="$(
+  python - <<'PY'
+import sys
+import pathlib
+import sysconfig
+import shlex
+
+try:
+  import numpy as np
+except Exception as ex:
+  print(f"ERROR: NumPy import failed: {ex}")
+  raise SystemExit(2)
+
+major_minor = f"{sys.version_info.major}.{sys.version_info.minor}"
+include_dir = sysconfig.get_path("include")
+libdir = pathlib.Path(sysconfig.get_config_var("LIBDIR") or (sys.prefix + "/lib"))
+ldlibrary = sysconfig.get_config_var("LDLIBRARY") or ""
+if not ldlibrary:
+  ldlibrary = f"libpython{major_minor}.so"
+
+python_library = libdir / ldlibrary
+if not python_library.exists():
+  fallback = libdir / f"libpython{major_minor}.so"
+  if fallback.exists():
+    python_library = fallback
+
+numpy_include = pathlib.Path(np.get_include())
+numpy_site = pathlib.Path(np.__file__).resolve().parents[1]
+
+def emit(name: str, value: object) -> None:
+  print(f"{name}={shlex.quote(str(value))}")
+
+emit("PYTHON_VERSION", major_minor)
+emit("PYTHON_INCLUDE_DIR", include_dir)
+emit("PYTHON_LIBPATH", libdir)
+emit("PYTHON_LIBRARY", python_library)
+emit("PYTHON_NUMPY_PATH", numpy_site)
+emit("PYTHON_NUMPY_INCLUDE_DIRS", numpy_include)
+PY
+)"
+
+eval "$py_info"
+
+build_cmake_args=(
+  "-DPYTHON_VERSION=${PYTHON_VERSION}"
+  "-DPYTHON_LIBPATH=${PYTHON_LIBPATH}"
+  "-DPYTHON_LIBRARY=${PYTHON_LIBRARY}"
+  "-DPYTHON_INCLUDE_DIR=${PYTHON_INCLUDE_DIR}"
+  "-DPYTHON_NUMPY_PATH=${PYTHON_NUMPY_PATH}"
+  "-DPYTHON_NUMPY_INCLUDE_DIRS=${PYTHON_NUMPY_INCLUDE_DIRS}"
+)
+
+if command -v nvcc >/dev/null 2>&1; then
+  cuda_arches="$(nvcc --list-gpu-code | awk 'NF {print $1}' | paste -sd';' -)"
+  if [[ -n "${cuda_arches}" ]]; then
+    if nvcc --list-gpu-arch | grep -q '^compute_75$'; then
+      cuda_arches="${cuda_arches};compute_75"
+    fi
+    # `BUILD_CMAKE_ARGS` is expanded unquoted inside GNUmakefile recipe commands.
+    # Escape semicolons so the shell does not treat list separators as command separators.
+    cuda_arches_escaped="${cuda_arches//;/\\;}"
+    build_cmake_args+=("-DCYCLES_CUDA_BINARIES_ARCH=${cuda_arches_escaped}")
+  fi
+fi
+
+build_cmake_args_str="$(printf '%s ' "${build_cmake_args[@]}")"
+
+if [[ -f CMakeCache.txt || -d CMakeFiles ]]; then
+  echo "Removing accidental in-source CMake cache from $(pwd)"
+  rm -rf CMakeCache.txt CMakeFiles
+fi
+
+extra_targets=("$@")
+for i in "${!extra_targets[@]}"; do
+  if [[ "${extra_targets[$i]}" == "deb" ]]; then
+    extra_targets[$i]="package_deb"
+  fi
+done
+
+make GNUmakefile BUILD_CMAKE_ARGS="${build_cmake_args_str}" \
+  ninja ccache release full bpy "${extra_targets[@]}"

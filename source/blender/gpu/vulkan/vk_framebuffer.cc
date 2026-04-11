@@ -879,7 +879,7 @@ void VKFrameBuffer::rendering_ensure_dynamic_rendering(VKContext &context,
       vk_format = image_view.vk_format();
     }
     attachment_info.imageView = vk_image_view;
-    attachment_info.imageLayout = supports_local_read ? VK_IMAGE_LAYOUT_RENDERING_LOCAL_READ_KHR :
+    attachment_info.imageLayout = supports_local_read ? to_vk_image_layout_rendering_local_read() :
                                                         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     set_load_store(attachment_info, load_stores[color_attachment_index]);
 

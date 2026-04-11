@@ -69,6 +69,7 @@ VkPrimitiveTopology to_vk_primitive_topology(const GPUPrimType prim_type);
 VkCullModeFlags to_vk_cull_mode_flags(const eGPUFaceCullTest cull_test);
 VkSamplerAddressMode to_vk_sampler_address_mode(const GPUSamplerExtendMode extend_mode);
 VkDescriptorType to_vk_descriptor_type(const shader::ShaderCreateInfo::Resource &resource);
+VkImageLayout to_vk_image_layout_rendering_local_read();
 
 template<typename T> VkObjectType to_vk_object_type(T /*vk_obj*/)
 {
