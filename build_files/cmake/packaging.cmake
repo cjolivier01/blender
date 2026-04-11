@@ -73,7 +73,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(CPACK_PACKAGE_RELOCATABLE "false")
     set(CPACK_RPM_PACKAGE_LICENSE "GPLv2+ and Apache 2.0")
     set(CPACK_RPM_PACKAGE_GROUP "Amusements/Multimedia")
-    set(CPACK_RPM_USER_BINARY_SPECFILE "${CMAKE_SOURCE_DIR}/build_files/package_spec/rpm/blender.spec.in")
+    set(_blender_rpm_spec "${CMAKE_SOURCE_DIR}/build_files/package_spec/rpm/blender.spec.in")
+    if(EXISTS "${_blender_rpm_spec}")
+      set(CPACK_RPM_USER_BINARY_SPECFILE "${_blender_rpm_spec}")
+    endif()
+    unset(_blender_rpm_spec)
   endif()
 
   # DEB packages.

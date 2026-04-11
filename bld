@@ -91,4 +91,4 @@ for i in "${!extra_targets[@]}"; do
 done
 
 make GNUmakefile BUILD_CMAKE_ARGS="${build_cmake_args_str}" \
-  ninja ccache release full bpy "${extra_targets[@]}"
+  release "${extra_targets[@]}"
