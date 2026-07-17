@@ -84,7 +84,7 @@ if [[ ${#available_packages[@]} -eq 0 ]]; then
 fi
 
 echo "Installing ${#available_packages[@]} Blender packages (mandatory + optional where available)..."
-sudo apt install -y "${available_packages[@]}"
+sudo apt install -y "${available_packages[@]}" liboslexec-dev
 
 pip install MaterialX
 

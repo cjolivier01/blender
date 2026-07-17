@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if ! command -v python >/dev/null 2>&1; then
-  echo "python not found in PATH"
-  exit 1
-fi
-
 if [[ -z "${CONDA_PREFIX:-}" ]]; then
   echo "CONDA_PREFIX is not set. Activate your conda env first."
   exit 1
 fi
 
+python_executable="${CONDA_PREFIX}/bin/python"
+if [[ ! -x "${python_executable}" ]]; then
+  echo "Python is not executable: ${python_executable}"
+  exit 1
+fi
+
 py_info="$(
-  python - <<'PY'
+  "${python_executable}" - <<'PY'
+import os
 import sys
 import pathlib
 import sysconfig
@@ -24,14 +26,23 @@ except Exception as ex:
   print(f"ERROR: NumPy import failed: {ex}")
   raise SystemExit(2)
 
+python_root = pathlib.Path(sys.prefix).resolve()
+conda_root = pathlib.Path(os.environ["CONDA_PREFIX"]).resolve()
+if python_root != conda_root:
+  print(f"ERROR: {sys.executable} uses prefix {python_root}, expected {conda_root}")
+  raise SystemExit(2)
+
 major_minor = f"{sys.version_info.major}.{sys.version_info.minor}"
-include_dir = sysconfig.get_path("include")
+include_dir = pathlib.Path(sysconfig.get_path("include"))
+include_config_dir = pathlib.Path(sysconfig.get_path("platinclude") or include_dir)
 libdir = pathlib.Path(sysconfig.get_config_var("LIBDIR") or (sys.prefix + "/lib"))
 ldlibrary = sysconfig.get_config_var("LDLIBRARY") or ""
 if not ldlibrary:
   ldlibrary = f"libpython{major_minor}.so"
 
-python_library = libdir / ldlibrary
+python_library = pathlib.Path(ldlibrary)
+if not python_library.is_absolute():
+  python_library = libdir / python_library
 if not python_library.exists():
   fallback = libdir / f"libpython{major_minor}.so"
   if fallback.exists():
@@ -39,16 +50,32 @@ if not python_library.exists():
 
 numpy_include = pathlib.Path(np.get_include())
 numpy_site = pathlib.Path(np.__file__).resolve().parents[1]
+numpy_libs = numpy_site / "numpy.libs"
+
+for label, path in (
+    ("Python include directory", include_dir),
+    ("Python configuration include directory", include_config_dir),
+    ("Python library directory", libdir),
+    ("Python library", python_library),
+    ("NumPy include directory", numpy_include),
+):
+  if not path.exists():
+    print(f"ERROR: {label} does not exist: {path}")
+    raise SystemExit(2)
 
 def emit(name: str, value: object) -> None:
   print(f"{name}={shlex.quote(str(value))}")
 
 emit("PYTHON_VERSION", major_minor)
+emit("PYTHON_ROOT_DIR", python_root)
+emit("PYTHON_EXECUTABLE", pathlib.Path(sys.executable).resolve())
 emit("PYTHON_INCLUDE_DIR", include_dir)
+emit("PYTHON_INCLUDE_CONFIG_DIR", include_config_dir)
 emit("PYTHON_LIBPATH", libdir)
 emit("PYTHON_LIBRARY", python_library)
 emit("PYTHON_NUMPY_PATH", numpy_site)
 emit("PYTHON_NUMPY_INCLUDE_DIRS", numpy_include)
+emit("PYTHON_NUMPY_LIBS", numpy_libs)
 PY
 )"
 
@@ -56,12 +83,21 @@ eval "$py_info"
 
 build_cmake_args=(
   "-DPYTHON_VERSION=${PYTHON_VERSION}"
+  "-DPYTHON_ROOT_DIR=${PYTHON_ROOT_DIR}"
+  "-DPYTHON_EXECUTABLE=${PYTHON_EXECUTABLE}"
   "-DPYTHON_LIBPATH=${PYTHON_LIBPATH}"
   "-DPYTHON_LIBRARY=${PYTHON_LIBRARY}"
   "-DPYTHON_INCLUDE_DIR=${PYTHON_INCLUDE_DIR}"
+  "-DPYTHON_INCLUDE_CONFIG_DIR=${PYTHON_INCLUDE_CONFIG_DIR}"
   "-DPYTHON_NUMPY_PATH=${PYTHON_NUMPY_PATH}"
   "-DPYTHON_NUMPY_INCLUDE_DIRS=${PYTHON_NUMPY_INCLUDE_DIRS}"
+  "-DWITH_INSTALL_PORTABLE=ON"
+  "-DWITH_PYTHON_INSTALL=ON"
+  "-DCMAKE_INSTALL_RPATH=${PYTHON_LIBPATH}"
+  "-DCMAKE_BUILD_WITH_INSTALL_RPATH=ON"
 )
+
+echo "Building Blender with Python ${PYTHON_VERSION} from ${PYTHON_ROOT_DIR}"
 
 if command -v nvcc >/dev/null 2>&1; then
   cuda_arches="$(nvcc --list-gpu-code | awk 'NF {print $1}' | paste -sd';' -)"
@@ -90,5 +126,38 @@ for i in "${!extra_targets[@]}"; do
   fi
 done
 
+make_targets=(ninja ccache release "${extra_targets[@]}")
+
+build_dir_base="${BUILD_DIR:-$(dirname "$(pwd -P)")/build_$(uname -s | tr '[:upper:]' '[:lower:]')}"
+build_dir="${build_dir_base}"
+for config_target in bpy debug full lite release cycles headless; do
+  for target in "${make_targets[@]}"; do
+    if [[ "${target}" == "${config_target}" ]]; then
+      build_dir="${build_dir}_${config_target}"
+      break
+    fi
+  done
+done
+
 make GNUmakefile BUILD_CMAKE_ARGS="${build_cmake_args_str}" \
-  release "${extra_targets[@]}"
+  "${make_targets[@]}"
+
+# Blender's NumPy install rule copies the package but not the companion directory
+# used by binary wheel builds for OpenBLAS and other shared libraries.
+if [[ -d "${PYTHON_NUMPY_LIBS}" ]]; then
+  cmake_cache="${build_dir}/CMakeCache.txt"
+  if [[ ! -f "${cmake_cache}" ]]; then
+    echo "CMake cache not found after build: ${cmake_cache}"
+    exit 1
+  fi
+
+  install_prefix="$(sed -n 's/^CMAKE_INSTALL_PREFIX:[^=]*=//p' "${cmake_cache}")"
+  blender_version="$(
+    awk '/^#define BLENDER_VERSION [0-9]+$/ {
+      printf "%d.%d", int($3 / 100), $3 % 100
+      exit
+    }' source/blender/blenkernel/BKE_blender_version.h
+  )"
+  installed_site_packages="${install_prefix}/${blender_version}/python/lib/python${PYTHON_VERSION}/site-packages"
+  cmake -E copy_directory "${PYTHON_NUMPY_LIBS}" "${installed_site_packages}/numpy.libs"
+fi

@@ -119,6 +119,23 @@ foreach(COMPONENT ${_opencollada_FIND_STATIC_COMPONENTS})
   endif()
 endforeach()
 
+# Some distro OpenCOLLADA static archives depend on libpcre symbols but do not
+# propagate that dependency transitively.
+find_library(OPENCOLLADA_PCRE_LIBRARY
+  NAMES
+    pcre
+  HINTS
+    ${_opencollada_SEARCH_DIRS}
+  PATH_SUFFIXES
+    lib64 lib
+    # Ubuntu ppa needs this.
+    lib64/opencollada lib/opencollada
+)
+mark_as_advanced(OPENCOLLADA_PCRE_LIBRARY)
+if(OPENCOLLADA_PCRE_LIBRARY)
+  list(APPEND _opencollada_LIBRARIES "${OPENCOLLADA_PCRE_LIBRARY}")
+endif()
+
 
 # handle the QUIETLY and REQUIRED arguments and set OPENCOLLADA_FOUND to TRUE if
 # all listed variables are TRUE
