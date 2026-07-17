@@ -105,59 +105,109 @@ if command -v nvcc >/dev/null 2>&1; then
     if nvcc --list-gpu-arch | grep -q '^compute_75$'; then
       cuda_arches="${cuda_arches};compute_75"
     fi
-    # `BUILD_CMAKE_ARGS` is expanded unquoted inside GNUmakefile recipe commands.
-    # Escape semicolons so the shell does not treat list separators as command separators.
-    cuda_arches_escaped="${cuda_arches//;/\\;}"
-    build_cmake_args+=("-DCYCLES_CUDA_BINARIES_ARCH=${cuda_arches_escaped}")
+    build_cmake_args+=("-DCYCLES_CUDA_BINARIES_ARCH=${cuda_arches}")
   fi
 fi
-
-build_cmake_args_str="$(printf '%s ' "${build_cmake_args[@]}")"
 
 if [[ -f CMakeCache.txt || -d CMakeFiles ]]; then
   echo "Removing accidental in-source CMake cache from $(pwd)"
   rm -rf CMakeCache.txt CMakeFiles
 fi
 
-extra_targets=("$@")
-for i in "${!extra_targets[@]}"; do
-  if [[ "${extra_targets[$i]}" == "deb" ]]; then
-    extra_targets[$i]="package_deb"
-  fi
+install_release=false
+package_deb=false
+for target in "$@"; do
+  case "${target}" in
+    install)
+      install_release=true
+      ;;
+    deb | package_deb)
+      package_deb=true
+      ;;
+    *)
+      echo "Unknown target: ${target}"
+      echo "Usage: ./bld [install] [deb]"
+      exit 2
+      ;;
+  esac
 done
-
-make_targets=(ninja ccache release "${extra_targets[@]}")
 
 build_dir_base="${BUILD_DIR:-$(dirname "$(pwd -P)")/build_$(uname -s | tr '[:upper:]' '[:lower:]')}"
-build_dir="${build_dir_base}"
-for config_target in bpy debug full lite release cycles headless; do
-  for target in "${make_targets[@]}"; do
-    if [[ "${target}" == "${config_target}" ]]; then
-      build_dir="${build_dir}_${config_target}"
-      break
-    fi
-  done
-done
+release_build_dir="${build_dir_base}_release"
+bpy_build_dir="${build_dir_base}_bpy_release"
+build_jobs="${NPROCS:-$(nproc)}"
 
-make GNUmakefile BUILD_CMAKE_ARGS="${build_cmake_args_str}" \
-  "${make_targets[@]}"
+echo "Configuring release build in ${release_build_dir}"
+cmake \
+  -C build_files/cmake/config/blender_release.cmake \
+  -DWITH_COMPILER_CCACHE=YES \
+  "${build_cmake_args[@]}" \
+  -G Ninja \
+  -S . \
+  -B "${release_build_dir}"
 
-# Blender's NumPy install rule copies the package but not the companion directory
-# used by binary wheel builds for OpenBLAS and other shared libraries.
-if [[ -d "${PYTHON_NUMPY_LIBS}" ]]; then
-  cmake_cache="${build_dir}/CMakeCache.txt"
-  if [[ ! -f "${cmake_cache}" ]]; then
-    echo "CMake cache not found after build: ${cmake_cache}"
-    exit 1
-  fi
+echo "Building release"
+cmake --build "${release_build_dir}" --parallel "${build_jobs}"
 
-  install_prefix="$(sed -n 's/^CMAKE_INSTALL_PREFIX:[^=]*=//p' "${cmake_cache}")"
-  blender_version="$(
-    awk '/^#define BLENDER_VERSION [0-9]+$/ {
-      printf "%d.%d", int($3 / 100), $3 % 100
-      exit
-    }' source/blender/blenkernel/BKE_blender_version.h
-  )"
-  installed_site_packages="${install_prefix}/${blender_version}/python/lib/python${PYTHON_VERSION}/site-packages"
-  cmake -E copy_directory "${PYTHON_NUMPY_LIBS}" "${installed_site_packages}/numpy.libs"
+if [[ "${package_deb}" == true ]]; then
+  cmake --build "${release_build_dir}" --parallel "${build_jobs}" --target package_deb
 fi
+
+if [[ "${install_release}" == true ]]; then
+  echo "Installing release"
+  cmake --install "${release_build_dir}"
+
+  # Blender's NumPy install rule copies the package but not the companion
+  # directory used by binary wheel builds for OpenBLAS and other shared libraries.
+  if [[ -d "${PYTHON_NUMPY_LIBS}" ]]; then
+    release_cmake_cache="${release_build_dir}/CMakeCache.txt"
+    install_prefix="$(sed -n 's/^CMAKE_INSTALL_PREFIX:[^=]*=//p' "${release_cmake_cache}")"
+    blender_version="$(
+      awk '/^#define BLENDER_VERSION [0-9]+$/ {
+        printf "%d.%d", int($3 / 100), $3 % 100
+        exit
+      }' source/blender/blenkernel/BKE_blender_version.h
+    )"
+    installed_site_packages="${install_prefix}/${blender_version}/python/lib/python${PYTHON_VERSION}/site-packages"
+    cmake -E copy_directory "${PYTHON_NUMPY_LIBS}" "${installed_site_packages}/numpy.libs"
+  fi
+fi
+
+# Build Blender again as a Python module in its own build directory, then package
+# the installed `bpy` package as a versioned wheel for the active Conda Python.
+bpy_cmake_args=()
+for arg in "${build_cmake_args[@]}"; do
+  if [[ "${arg}" == -DWITH_PYTHON_INSTALL=* ]]; then
+    bpy_cmake_args+=("-DWITH_PYTHON_INSTALL=OFF")
+  else
+    bpy_cmake_args+=("${arg}")
+  fi
+done
+echo "Configuring bpy build in ${bpy_build_dir}"
+cmake \
+  -C build_files/cmake/config/blender_release.cmake \
+  -C build_files/cmake/config/bpy_module.cmake \
+  -DWITH_COMPILER_CCACHE=YES \
+  "${bpy_cmake_args[@]}" \
+  -G Ninja \
+  -S . \
+  -B "${bpy_build_dir}"
+
+echo "Building bpy module"
+cmake --build "${bpy_build_dir}" --parallel "${build_jobs}"
+cmake --install "${bpy_build_dir}"
+
+bpy_cmake_cache="${bpy_build_dir}/CMakeCache.txt"
+if [[ ! -f "${bpy_cmake_cache}" ]]; then
+  echo "bpy CMake cache not found after build: ${bpy_cmake_cache}"
+  exit 1
+fi
+
+bpy_install_dir="$(sed -n 's/^CMAKE_INSTALL_PREFIX:[^=]*=//p' "${bpy_cmake_cache}")"
+wheel_output_dir="${bpy_build_dir}/wheel"
+"${python_executable}" build_files/utils/make_bpy_wheel.py \
+  "${bpy_install_dir}" \
+  --build-dir="${bpy_build_dir}" \
+  --output-dir="${wheel_output_dir}"
+
+echo "bpy wheel written to ${wheel_output_dir}"
