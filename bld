@@ -1,0 +1,402 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "${repo_root}"
+
+usage() {
+  cat <<'EOF'
+Build Blender 5.2 and/or its bpy wheel.
+
+Usage: ./bld [all|release|bpy] [install] [deb] [clean]
+
+With no arguments, both the Blender release and bpy wheel are built.
+
+  all       Build Blender and the bpy wheel (default).
+  release   Build the Blender application.
+  bpy       Build and validate the bpy module and wheel.
+  install   Install the Blender application after building it.
+  deb       Build a Debian package after building Blender.
+  clean     Remove the selected build directories before configuring.
+
+Environment overrides:
+  BUILD_DIR       Base build path (default: ../build_linux_5_2).
+  NPROCS          Parallel build jobs (default: nproc).
+  CMAKE_COMMAND   CMake executable (default: cmake from PATH).
+  BPY_PYTHON      Python used for bpy instead of Blender's bundled Python.
+                  It must match Blender's supported Python major/minor version.
+
+An active Conda environment is used for bpy automatically when its Python
+major/minor version matches Blender's supported version. Otherwise the pinned
+Python from lib/linux_x64 is used, and the resulting wheel remains compatible
+with any CPython installation (including Conda) with that same ABI.
+EOF
+}
+
+build_release=false
+build_bpy=false
+selection_seen=false
+install_release=false
+package_deb=false
+clean_build=false
+
+for target in "$@"; do
+  case "${target}" in
+    all)
+      build_release=true
+      build_bpy=true
+      selection_seen=true
+      ;;
+    release)
+      build_release=true
+      selection_seen=true
+      ;;
+    bpy)
+      build_bpy=true
+      selection_seen=true
+      ;;
+    install)
+      build_release=true
+      install_release=true
+      ;;
+    deb | package_deb)
+      build_release=true
+      package_deb=true
+      ;;
+    clean)
+      clean_build=true
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown target: ${target}" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ "${selection_seen}" == false && "${install_release}" == false && "${package_deb}" == false ]]; then
+  build_release=true
+  build_bpy=true
+fi
+
+cmake_command="${CMAKE_COMMAND:-cmake}"
+if ! command -v "${cmake_command}" >/dev/null 2>&1; then
+  echo "CMake is not available: ${cmake_command}" >&2
+  echo "Run ./install_deps.sh first." >&2
+  exit 1
+fi
+
+if ! command -v ninja >/dev/null 2>&1; then
+  echo "Ninja is not available. Run ./install_deps.sh first." >&2
+  exit 1
+fi
+
+blender_version="$(
+  awk '/^#define BLENDER_VERSION [0-9]+$/ {
+    printf "%d.%d", int($3 / 100), $3 % 100
+    exit
+  }' source/blender/blenkernel/BKE_blender_version.h
+)"
+blender_version="${blender_version// /}"
+if [[ -z "${blender_version}" ]]; then
+  echo "Unable to determine the Blender version." >&2
+  exit 1
+fi
+
+supported_python="$(
+  sed -n 's/^set(_PYTHON_VERSION_SUPPORTED[[:space:]]\+\([0-9][0-9.]*\)).*/\1/p' \
+    build_files/cmake/Modules/FindPythonLibsUnix.cmake
+)"
+supported_python="${supported_python// /}"
+if [[ -z "${supported_python}" ]]; then
+  echo "Unable to determine Blender's supported Python version." >&2
+  exit 1
+fi
+
+case "$(uname -m)" in
+  x86_64)
+    library_arch="x64"
+    ;;
+  aarch64 | arm64)
+    library_arch="arm64"
+    ;;
+  *)
+    echo "Unsupported architecture for Blender's precompiled libraries: $(uname -m)" >&2
+    exit 1
+    ;;
+esac
+
+library_dir="${repo_root}/lib/linux_${library_arch}"
+bundled_python="${library_dir}/python/bin/python${supported_python}"
+if [[ ! -x "${bundled_python}" ]]; then
+  echo "Blender's precompiled libraries or Python ${supported_python} are missing." >&2
+  echo "Run ./install_deps.sh first." >&2
+  exit 1
+fi
+
+build_dir_base="${BUILD_DIR:-$(dirname "${repo_root}")/build_linux_${blender_version//./_}}"
+release_build_dir="${build_dir_base}_release"
+bpy_build_dir="${build_dir_base}_bpy_release"
+build_jobs="${NPROCS:-$(nproc)}"
+
+if ! [[ "${build_jobs}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "NPROCS must be a positive integer, got: ${build_jobs}" >&2
+  exit 2
+fi
+
+if [[ "${clean_build}" == true ]]; then
+  if [[ "${build_release}" == true ]]; then
+    echo "Removing ${release_build_dir}"
+    "${cmake_command}" -E remove_directory "${release_build_dir}"
+  fi
+  if [[ "${build_bpy}" == true ]]; then
+    echo "Removing ${bpy_build_dir}"
+    "${cmake_command}" -E remove_directory "${bpy_build_dir}"
+  fi
+fi
+
+if [[ -f CMakeCache.txt || -d CMakeFiles ]]; then
+  echo "Removing accidental in-source CMake state from ${repo_root}"
+  "${cmake_command}" -E remove -f CMakeCache.txt
+  "${cmake_command}" -E remove_directory CMakeFiles
+fi
+
+ccache_option=OFF
+if command -v ccache >/dev/null 2>&1; then
+  ccache_option=ON
+fi
+
+common_cmake_args=(
+  "-DWITH_COMPILER_CCACHE=${ccache_option}"
+  "-DWITH_LIBS_PRECOMPILED=ON"
+)
+
+# DPCPP otherwise selects the highest GCC directory it can see. Ubuntu 26.04
+# can retain a GCC runtime directory without the matching libstdc++ headers,
+# which makes the optional oneAPI kernel fail on basic headers like iostream.
+# Point it at the complete GCC installation selected by the host C++ compiler.
+cxx_command="${CXX:-c++}"
+if [[ -x "${library_dir}/dpcpp/bin/clang++" ]] && command -v "${cxx_command}" >/dev/null 2>&1; then
+  libgcc_path="$("${cxx_command}" -print-libgcc-file-name)"
+  gcc_install_dir="$(dirname "${libgcc_path}")"
+  if [[ -f "${libgcc_path}" && -d "${gcc_install_dir}" ]]; then
+    common_cmake_args+=("-DSYCL_CPP_FLAGS=--gcc-install-dir=${gcc_install_dir}")
+  fi
+fi
+
+if [[ "${build_release}" == true ]]; then
+  echo "Configuring Blender ${blender_version} release in ${release_build_dir}"
+  "${cmake_command}" \
+    -C build_files/cmake/config/blender_release.cmake \
+    "${common_cmake_args[@]}" \
+    -G Ninja \
+    -S . \
+    -B "${release_build_dir}"
+
+  echo "Building Blender release with ${build_jobs} jobs"
+  "${cmake_command}" --build "${release_build_dir}" --parallel "${build_jobs}"
+
+  # Blender 5.2 leaves several required shared libraries (including MaterialX)
+  # unstaged after a raw CMake build. The default install prefix is the build's
+  # bin directory, so this makes the local executable runnable without a
+  # system-wide install.
+  echo "Staging Blender runtime files"
+  "${cmake_command}" --install "${release_build_dir}"
+
+  blender_executable="${release_build_dir}/bin/blender"
+  if [[ ! -x "${blender_executable}" ]]; then
+    echo "Blender executable was not produced: ${blender_executable}" >&2
+    exit 1
+  fi
+  "${blender_executable}" --version | sed -n '1,2p'
+
+  if [[ "${package_deb}" == true ]]; then
+    echo "Building Debian package"
+    "${cmake_command}" --build "${release_build_dir}" --parallel "${build_jobs}" --target package_deb
+  fi
+
+  if [[ "${install_release}" == true ]]; then
+    install_prefix="$(sed -n 's/^CMAKE_INSTALL_PREFIX:[^=]*=//p' "${release_build_dir}/CMakeCache.txt")"
+    echo "Blender release installed in ${install_prefix}"
+  fi
+fi
+
+if [[ "${build_bpy}" == true ]]; then
+  bpy_python="${bundled_python}"
+  python_was_explicit=false
+
+  if [[ -n "${BPY_PYTHON:-}" ]]; then
+    bpy_python="${BPY_PYTHON}"
+    python_was_explicit=true
+  elif [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
+    conda_python_version="$(
+      "${CONDA_PREFIX}/bin/python" -c \
+        'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")'
+    )"
+    conda_python_version="${conda_python_version// /}"
+    if [[ "${conda_python_version}" == "${supported_python}" ]]; then
+      bpy_python="${CONDA_PREFIX}/bin/python"
+      python_was_explicit=true
+      echo "Using active Conda Python ${conda_python_version} for bpy"
+    else
+      echo "Active Conda Python ${conda_python_version} does not match Blender's Python ${supported_python};"
+      echo "using the pinned Blender Python at ${bundled_python}."
+    fi
+  fi
+
+  if [[ ! -x "${bpy_python}" ]]; then
+    echo "bpy Python is not executable: ${bpy_python}" >&2
+    exit 1
+  fi
+
+  bpy_python_version="$(
+    "${bpy_python}" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")'
+  )"
+  bpy_python_version="${bpy_python_version// /}"
+  if [[ "${bpy_python_version}" != "${supported_python}" ]]; then
+    echo "bpy requires Python ${supported_python}, but ${bpy_python} is ${bpy_python_version}." >&2
+    exit 1
+  fi
+
+  bpy_cmake_args=(
+    "-DWITH_INSTALL_PORTABLE=ON"
+    "-DWITH_PYTHON_INSTALL=OFF"
+  )
+
+  release_oneapi_kernel="${release_build_dir}/intern/cycles/kernel/device/oneapi/libcycles_kernel_oneapi_aot.so"
+  if [[ -f "${release_oneapi_kernel}" ]]; then
+    bpy_cmake_args+=("-DCYCLES_ONEAPI_PRECOMPILED_KERNEL=${release_oneapi_kernel}")
+  fi
+
+  # Preserve the v4.4 helper's ability to build bpy against an active Conda
+  # Python, but only when its ABI matches the Python version supported by 5.2.
+  if [[ "${python_was_explicit}" == true ]]; then
+    py_info="$(
+      "${bpy_python}" - <<'PY'
+import pathlib
+import shlex
+import sys
+import sysconfig
+
+try:
+    import numpy as np
+except Exception as ex:
+    print(f"ERROR: NumPy import failed: {ex}")
+    raise SystemExit(2)
+
+major_minor = f"{sys.version_info.major}.{sys.version_info.minor}"
+python_root = pathlib.Path(sys.prefix).resolve()
+include_dir = pathlib.Path(sysconfig.get_path("include"))
+include_config_dir = pathlib.Path(sysconfig.get_path("platinclude") or include_dir)
+libdir = pathlib.Path(sysconfig.get_config_var("LIBDIR") or (sys.prefix + "/lib"))
+ldlibrary = sysconfig.get_config_var("LDLIBRARY") or f"libpython{major_minor}.so"
+python_library = pathlib.Path(ldlibrary)
+if not python_library.is_absolute():
+    python_library = libdir / python_library
+numpy_include = pathlib.Path(np.get_include())
+numpy_site = pathlib.Path(np.__file__).resolve().parents[1]
+
+for label, path in (
+    ("Python include directory", include_dir),
+    ("Python configuration include directory", include_config_dir),
+    ("Python library directory", libdir),
+    ("Python library", python_library),
+    ("NumPy include directory", numpy_include),
+):
+    if not path.exists():
+        print(f"ERROR: {label} does not exist: {path}")
+        raise SystemExit(2)
+
+def emit(name, value):
+    print(f"{name}={shlex.quote(str(value))}")
+
+emit("PYTHON_VERSION", major_minor)
+emit("PYTHON_ROOT_DIR", python_root)
+emit("PYTHON_EXECUTABLE", pathlib.Path(sys.executable).resolve())
+emit("PYTHON_INCLUDE_DIR", include_dir)
+emit("PYTHON_INCLUDE_CONFIG_DIR", include_config_dir)
+emit("PYTHON_LIBPATH", libdir)
+emit("PYTHON_LIBRARY", python_library)
+emit("PYTHON_NUMPY_PATH", numpy_site)
+emit("PYTHON_NUMPY_INCLUDE_DIRS", numpy_include)
+PY
+    )"
+    eval "${py_info}"
+    bpy_cmake_args+=(
+      "-DPYTHON_VERSION=${PYTHON_VERSION}"
+      "-DPYTHON_ROOT_DIR=${PYTHON_ROOT_DIR}"
+      "-DPYTHON_EXECUTABLE=${PYTHON_EXECUTABLE}"
+      "-DPYTHON_LIBPATH=${PYTHON_LIBPATH}"
+      "-DPYTHON_LIBRARY=${PYTHON_LIBRARY}"
+      "-DPYTHON_INCLUDE_DIR=${PYTHON_INCLUDE_DIR}"
+      "-DPYTHON_INCLUDE_CONFIG_DIR=${PYTHON_INCLUDE_CONFIG_DIR}"
+      "-DPYTHON_NUMPY_PATH=${PYTHON_NUMPY_PATH}"
+      "-DPYTHON_NUMPY_INCLUDE_DIRS=${PYTHON_NUMPY_INCLUDE_DIRS}"
+    )
+  fi
+
+  echo "Configuring bpy in ${bpy_build_dir}"
+  "${cmake_command}" \
+    -C build_files/cmake/config/blender_release.cmake \
+    -C build_files/cmake/config/bpy_module.cmake \
+    "${common_cmake_args[@]}" \
+    "${bpy_cmake_args[@]}" \
+    -G Ninja \
+    -S . \
+    -B "${bpy_build_dir}"
+
+  # The release and bpy configurations generate identical offline GPU kernels.
+  # Reuse a completed release build when available; these artifacts are large
+  # and the oneAPI compiler is intentionally serialized.
+  release_device_dir="${release_build_dir}/intern/cycles/kernel/device"
+  if [[ -d "${release_device_dir}" ]]; then
+    echo "Reusing compatible offline GPU kernels from the release build"
+    while IFS= read -r artifact; do
+      relative_artifact="${artifact#"${release_build_dir}/"}"
+      destination="${bpy_build_dir}/${relative_artifact}"
+      mkdir -p "$(dirname "${destination}")"
+      cp --reflink=auto "${artifact}" "${destination}"
+    done < <(
+      find "${release_device_dir}" -maxdepth 2 -type f \
+        -name 'kernel_*' -print
+    )
+  fi
+
+  echo "Building bpy with ${build_jobs} jobs"
+  "${cmake_command}" --build "${bpy_build_dir}" --parallel "${build_jobs}"
+  "${cmake_command}" --install "${bpy_build_dir}"
+
+  bpy_cmake_cache="${bpy_build_dir}/CMakeCache.txt"
+  bpy_install_dir="$(sed -n 's/^CMAKE_INSTALL_PREFIX:[^=]*=//p' "${bpy_cmake_cache}")"
+  if [[ ! -d "${bpy_install_dir}/bpy" ]]; then
+    echo "Installed bpy package was not produced in ${bpy_install_dir}." >&2
+    exit 1
+  fi
+
+  echo "Validating the installed bpy package"
+  PYTHONPATH="${bpy_install_dir}" "${bpy_python}" - <<'PY'
+import bpy
+
+assert bpy.app.version[:2] == (5, 2), bpy.app.version_string
+print(f"bpy {bpy.app.version_string} imported successfully")
+PY
+
+  wheel_output_dir="${bpy_build_dir}/wheel"
+  "${bpy_python}" build_files/utils/make_bpy_wheel.py \
+    "${bpy_install_dir}" \
+    --build-dir="${bpy_build_dir}" \
+    --output-dir="${wheel_output_dir}"
+
+  wheel_path="$(find "${wheel_output_dir}" -maxdepth 1 -type f -name 'bpy-*.whl' -printf '%T@ %p\n' \
+    | sort -nr | sed -n '1s/^[^ ]* //p')"
+  if [[ -z "${wheel_path}" || ! -f "${wheel_path}" ]]; then
+    echo "bpy wheel was not produced in ${wheel_output_dir}." >&2
+    exit 1
+  fi
+  "${bpy_python}" -m zipfile -t "${wheel_path}" >/dev/null
+  echo "bpy wheel written to ${wheel_path}"
+fi

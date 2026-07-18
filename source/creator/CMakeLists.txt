@@ -2123,7 +2123,7 @@ if(UNIX AND NOT APPLE)
       # Blender's requirement of libraries mean the installation path must be used.
       install(
         CODE "\
-set(BLENDER_BIN \"${CMAKE_INSTALL_PREFIX}/${BLENDER_BIN}\")\n\
+set(BLENDER_BIN \"\${CMAKE_INSTALL_PREFIX}/${BLENDER_BIN}\")\n\
 if(DEFINED ENV\{DESTDIR\})\n\
   set(BLENDER_BIN \"$ENV\{DESTDIR\}/$\{BLENDER_BIN\}\")\n\
 endif()\n\

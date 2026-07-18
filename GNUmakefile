@@ -45,6 +45,7 @@ Project Files
 
 Package Targets
 
+   * package_deb:       Build a Debian package (Linux only).
    * package_archive:   Build an archive package.
 
 Testing Targets
@@ -467,8 +468,12 @@ help: .FORCE
 #
 
 package_archive: .FORCE
-	make -C "$(BUILD_DIR)" -s package_archive
+	$(BUILD_COMMAND) -C "$(BUILD_DIR)" package_archive
 	@echo archive in "$(BUILD_DIR)/release"
+
+package_deb: .FORCE
+	$(BUILD_COMMAND) -C "$(BUILD_DIR)" package_deb
+	@echo deb in "$(BUILD_DIR)/release"
 
 
 # -----------------------------------------------------------------------------
