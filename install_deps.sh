@@ -110,4 +110,34 @@ import wheel
 print(f"Pinned Python dependencies ready (Python packages: numpy {numpy.__version__}, setuptools {setuptools.__version__})")
 PY
 
+if [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
+  conda_python="${CONDA_PREFIX}/bin/python"
+  conda_python_version="$(
+    "${conda_python}" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")'
+  )"
+  if ! "${conda_python}" - "${supported_python}" <<'PY'
+import sys
+
+required = tuple(map(int, sys.argv[1].split(".")))
+raise SystemExit(sys.version_info[:2] < required)
+PY
+  then
+    echo "Active Conda Python ${conda_python_version} is older than Blender's Python ${supported_python}." >&2
+    exit 1
+  fi
+
+  if ! "${conda_python}" -c \
+    'import cattrs, Cython, MaterialX, numpy, requests, setuptools, wheel, zstandard' >/dev/null 2>&1
+  then
+    "${conda_python}" -m pip install --only-binary=:all: \
+      cattrs cython MaterialX 'numpy>=2.2,<3.0' requests setuptools wheel zstandard
+  fi
+  "${conda_python}" - <<'PY'
+import numpy
+import sys
+
+print(f"Conda Python dependencies ready ({sys.executable}, NumPy {numpy.__version__})")
+PY
+fi
+
 echo "Blender build dependencies are ready."

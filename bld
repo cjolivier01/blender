@@ -24,12 +24,11 @@ Environment overrides:
   NPROCS          Parallel build jobs (default: nproc).
   CMAKE_COMMAND   CMake executable (default: cmake from PATH).
   BPY_PYTHON      Python used for bpy instead of Blender's bundled Python.
-                  It must match Blender's supported Python major/minor version.
+                  It must be at least Blender's supported Python version.
 
-An active Conda environment is used for bpy automatically when its Python
-major/minor version matches Blender's supported version. Otherwise the pinned
-Python from lib/linux_x64 is used, and the resulting wheel remains compatible
-with any CPython installation (including Conda) with that same ABI.
+An active Conda environment is used for bpy automatically. Its Python version
+must be at least Blender's supported version. When no Conda environment is
+active, Blender's pinned Python is used.
 EOF
 }
 
@@ -116,6 +115,16 @@ if [[ -z "${supported_python}" ]]; then
   echo "Unable to determine Blender's supported Python version." >&2
   exit 1
 fi
+
+python_version_at_least() {
+  local candidate_major="${1%%.*}"
+  local candidate_minor="${1#*.}"
+  local required_major="${2%%.*}"
+  local required_minor="${2#*.}"
+
+  ((candidate_major > required_major ||
+    (candidate_major == required_major && candidate_minor >= required_minor)))
+}
 
 case "$(uname -m)" in
   x86_64)
@@ -238,13 +247,14 @@ if [[ "${build_bpy}" == true ]]; then
         'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")'
     )"
     conda_python_version="${conda_python_version// /}"
-    if [[ "${conda_python_version}" == "${supported_python}" ]]; then
+    if python_version_at_least "${conda_python_version}" "${supported_python}"; then
       bpy_python="${CONDA_PREFIX}/bin/python"
       python_was_explicit=true
       echo "Using active Conda Python ${conda_python_version} for bpy"
     else
-      echo "Active Conda Python ${conda_python_version} does not match Blender's Python ${supported_python};"
-      echo "using the pinned Blender Python at ${bundled_python}."
+      echo "Active Conda Python ${conda_python_version} is older than Blender's Python ${supported_python}." >&2
+      echo "Activate Python ${supported_python} or newer, or unset CONDA_PREFIX." >&2
+      exit 1
     fi
   fi
 
@@ -257,8 +267,17 @@ if [[ "${build_bpy}" == true ]]; then
     "${bpy_python}" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")'
   )"
   bpy_python_version="${bpy_python_version// /}"
-  if [[ "${bpy_python_version}" != "${supported_python}" ]]; then
-    echo "bpy requires Python ${supported_python}, but ${bpy_python} is ${bpy_python_version}." >&2
+  if ! python_version_at_least "${bpy_python_version}" "${supported_python}"; then
+    echo "bpy requires Python ${supported_python} or newer, but ${bpy_python} is ${bpy_python_version}." >&2
+    exit 1
+  fi
+
+  if [[ "${python_was_explicit}" == true ]] && ! "${bpy_python}" -c \
+    'import cattrs, Cython, MaterialX, numpy, requests, setuptools, wheel, zstandard' \
+    >/dev/null 2>&1
+  then
+    echo "The selected Python is missing bpy build/runtime packages." >&2
+    echo "Run ./install_deps.sh before building bpy." >&2
     exit 1
   fi
 
@@ -297,6 +316,10 @@ ldlibrary = sysconfig.get_config_var("LDLIBRARY") or f"libpython{major_minor}.so
 python_library = pathlib.Path(ldlibrary)
 if not python_library.is_absolute():
     python_library = libdir / python_library
+if not python_library.exists():
+    shared_library = libdir / f"libpython{major_minor}.so"
+    if shared_library.exists():
+        python_library = shared_library
 numpy_include = pathlib.Path(np.get_include())
 numpy_site = pathlib.Path(np.__file__).resolve().parents[1]
 
@@ -349,6 +372,13 @@ PY
     -S . \
     -B "${bpy_build_dir}"
 
+  configured_bpy_python="$(sed -n 's/^PYTHON_EXECUTABLE:[^=]*=//p' "${bpy_build_dir}/CMakeCache.txt")"
+  if [[ "$(readlink -f "${configured_bpy_python}")" != "$(readlink -f "${bpy_python}")" ]]; then
+    echo "bpy was configured for ${configured_bpy_python}, expected ${bpy_python}." >&2
+    exit 1
+  fi
+  echo "Confirmed bpy CMake Python: ${configured_bpy_python}"
+
   # The release and bpy configurations generate identical offline GPU kernels.
   # Reuse a completed release build when available; these artifacts are large
   # and the oneAPI compiler is intentionally serialized.
@@ -380,12 +410,14 @@ PY
   echo "Validating the installed bpy package"
   PYTHONPATH="${bpy_install_dir}" "${bpy_python}" - <<'PY'
 import bpy
+import sys
 
 assert bpy.app.version[:2] == (5, 2), bpy.app.version_string
-print(f"bpy {bpy.app.version_string} imported successfully")
+print(f"bpy {bpy.app.version_string} imported successfully with {sys.executable}")
 PY
 
   wheel_output_dir="${bpy_build_dir}/wheel"
+  "${cmake_command}" -E remove_directory "${wheel_output_dir}"
   "${bpy_python}" build_files/utils/make_bpy_wheel.py \
     "${bpy_install_dir}" \
     --build-dir="${bpy_build_dir}" \
