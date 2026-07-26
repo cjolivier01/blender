@@ -23,6 +23,14 @@ Environment overrides:
   BUILD_DIR       Base build path (default: ../build_linux_5_2).
   NPROCS          Parallel build jobs (default: nproc).
   CMAKE_COMMAND   CMake executable (default: cmake from PATH).
+  NATIVE_CPU_BUILD
+                  Build for the current host CPU instead of Blender's
+                  portable x86-64-v2 baseline (default: ON). This enables all
+                  instructions supported by the build host, including AVX2
+                  and AVX-512 where available. Set to OFF for portable builds.
+  OPTIX_ROOT_DIR  Optional path to an extracted NVIDIA OptiX SDK. The path
+                  must contain include/optix.h. OptiX accelerates Cycles
+                  rendering only; it does not accelerate mesh operations.
   BPY_PYTHON      Python used for bpy instead of Blender's bundled Python.
                   It must be at least Blender's supported Python version.
 
@@ -239,11 +247,25 @@ release_build_dir="${build_dir_base}_release"
 bpy_build_dir="${build_dir_base}_bpy_release"
 release_install_dir="${release_build_dir}/install"
 build_jobs="${NPROCS:-$(nproc)}"
+native_cpu_build="${NATIVE_CPU_BUILD:-ON}"
 
 if ! [[ "${build_jobs}" =~ ^[1-9][0-9]*$ ]]; then
   echo "NPROCS must be a positive integer, got: ${build_jobs}" >&2
   exit 2
 fi
+
+case "${native_cpu_build,,}" in
+  1 | on | true | yes)
+    native_cpu_build=true
+    ;;
+  0 | off | false | no)
+    native_cpu_build=false
+    ;;
+  *)
+    echo "NATIVE_CPU_BUILD must be ON or OFF, got: ${native_cpu_build}" >&2
+    exit 2
+    ;;
+esac
 
 if [[ "${clean_build}" == true ]]; then
   if [[ "${build_release}" == true ]]; then
@@ -266,17 +288,118 @@ ccache_option=OFF
 if command -v ccache >/dev/null 2>&1; then
   ccache_option=ON
 fi
+cxx_command="${CXX:-c++}"
 
 common_cmake_args=(
   "-DWITH_COMPILER_CCACHE=${ccache_option}"
   "-DWITH_LIBS_PRECOMPILED=ON"
 )
 
+# Blender's portable Linux default is x86-64-v2.  This is a local build, so
+# compile Blender and bpy for the actual build host by default.  Keep Blender's
+# conservative floating-point and -O2 release defaults: -ffast-math and -O3
+# are intentionally not enabled because they can change results or cause
+# known Blender build/runtime problems.
+native_cpu_flags=()
+if [[ "${native_cpu_build}" == true ]]; then
+  case "$(uname -m)" in
+    x86_64)
+      native_cpu_flags=(-march=native -mtune=native)
+      ;;
+    aarch64 | arm64)
+      native_cpu_flags=(-mcpu=native)
+      ;;
+    *)
+      echo "Host-native CPU tuning is unsupported on $(uname -m)." >&2
+      echo "Set NATIVE_CPU_BUILD=OFF to use Blender's portable defaults." >&2
+      exit 1
+      ;;
+  esac
+
+  c_command="${CC:-cc}"
+  if ! command -v "${c_command}" >/dev/null 2>&1 ||
+    ! printf 'int main(void) { return 0; }\n' |
+      "${c_command}" "${native_cpu_flags[@]}" -x c -c -o /dev/null -
+  then
+    echo "The C compiler does not support native CPU flags: ${native_cpu_flags[*]}" >&2
+    exit 1
+  fi
+  if ! command -v "${cxx_command}" >/dev/null 2>&1 ||
+    ! printf 'int main() { return 0; }\n' |
+      "${cxx_command}" "${native_cpu_flags[@]}" -x c++ -c -o /dev/null -
+  then
+    echo "The C++ compiler does not support native CPU flags: ${native_cpu_flags[*]}" >&2
+    exit 1
+  fi
+
+  native_cpu_flags_string="${native_cpu_flags[*]}"
+  common_cmake_args+=(
+    "-DWITH_COMPILER_SIMD=OFF"
+    "-DCMAKE_C_FLAGS=${CFLAGS:+${CFLAGS} }${native_cpu_flags_string}"
+    "-DCMAKE_CXX_FLAGS=${CXXFLAGS:+${CXXFLAGS} }${native_cpu_flags_string}"
+  )
+  echo "Host-native CPU code generation enabled: ${native_cpu_flags_string}"
+  echo "The resulting binaries are intended for this CPU generation."
+else
+  # Reset values cached by an earlier native build so the documented portable
+  # switch works without requiring a clean build directory.
+  common_cmake_args+=(
+    "-DWITH_COMPILER_SIMD=ON"
+    "-DCMAKE_C_FLAGS=${CFLAGS:-}"
+    "-DCMAKE_CXX_FLAGS=${CXXFLAGS:-}"
+  )
+fi
+
+if [[ -n "${OPTIX_ROOT_DIR:-}" ]]; then
+  if [[ ! -f "${OPTIX_ROOT_DIR}/include/optix.h" ]]; then
+    echo "OPTIX_ROOT_DIR does not contain include/optix.h: ${OPTIX_ROOT_DIR}" >&2
+    exit 1
+  fi
+  optix_root="$(readlink -f "${OPTIX_ROOT_DIR}")"
+  common_cmake_args+=("-DOPTIX_ROOT_DIR=${optix_root}")
+  echo "Using NVIDIA OptiX SDK from ${optix_root}"
+else
+  # Do not retain an SDK path from an earlier configuration after the caller
+  # deliberately removes OPTIX_ROOT_DIR from the build environment.
+  common_cmake_args+=("-DOPTIX_ROOT_DIR=")
+fi
+
+verify_native_cpu_configuration() {
+  local configured_build_dir="$1"
+  if [[ "${native_cpu_build}" != true ]]; then
+    return
+  fi
+  if ! grep -q -- "${native_cpu_flags[0]}" "${configured_build_dir}/build.ninja"; then
+    echo "Native CPU flags are missing from ${configured_build_dir}/build.ninja" >&2
+    exit 1
+  fi
+  if grep -q -- '-march=x86-64-v2' "${configured_build_dir}/build.ninja"; then
+    echo "Blender's portable x86-64-v2 flag still appears in ${configured_build_dir}/build.ninja" >&2
+    exit 1
+  fi
+  echo "Confirmed native CPU flags in ${configured_build_dir}/build.ninja"
+}
+
+verify_optix_configuration() {
+  local configured_build_dir="$1"
+  if [[ -z "${OPTIX_ROOT_DIR:-}" ]]; then
+    return
+  fi
+  local configured_optix_include
+  configured_optix_include="$(
+    sed -n 's/^OPTIX_INCLUDE_DIR:[^=]*=//p' "${configured_build_dir}/CMakeCache.txt"
+  )"
+  if [[ -z "${configured_optix_include}" || "${configured_optix_include}" == *NOTFOUND* ]]; then
+    echo "OptiX was requested but CMake did not find its headers." >&2
+    exit 1
+  fi
+  echo "Confirmed OptiX headers: ${configured_optix_include}"
+}
+
 # DPCPP otherwise selects the highest GCC directory it can see. Ubuntu 26.04
 # can retain a GCC runtime directory without the matching libstdc++ headers,
 # which makes the optional oneAPI kernel fail on basic headers like iostream.
 # Point it at the complete GCC installation selected by the host C++ compiler.
-cxx_command="${CXX:-c++}"
 if [[ -x "${library_dir}/dpcpp/bin/clang++" ]] && command -v "${cxx_command}" >/dev/null 2>&1; then
   libgcc_path="$("${cxx_command}" -print-libgcc-file-name)"
   gcc_install_dir="$(dirname "${libgcc_path}")"
@@ -323,6 +446,8 @@ if [[ "${build_release}" == true ]]; then
     -G Ninja \
     -S . \
     -B "${release_build_dir}"
+  verify_native_cpu_configuration "${release_build_dir}"
+  verify_optix_configuration "${release_build_dir}"
 
   configured_release_python="$(sed -n 's/^PYTHON_EXECUTABLE:[^=]*=//p' "${release_build_dir}/CMakeCache.txt")"
   if [[ "$(readlink -f "${configured_release_python}")" != "$(readlink -f "${release_python}")" ]]; then
@@ -456,6 +581,8 @@ if [[ "${build_bpy}" == true ]]; then
     -G Ninja \
     -S . \
     -B "${bpy_build_dir}"
+  verify_native_cpu_configuration "${bpy_build_dir}"
+  verify_optix_configuration "${bpy_build_dir}"
 
   configured_bpy_python="$(sed -n 's/^PYTHON_EXECUTABLE:[^=]*=//p' "${bpy_build_dir}/CMakeCache.txt")"
   if [[ "$(readlink -f "${configured_bpy_python}")" != "$(readlink -f "${bpy_python}")" ]]; then
