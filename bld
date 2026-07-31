@@ -28,6 +28,10 @@ Environment overrides:
                   portable x86-64-v2 baseline (default: ON). This enables all
                   instructions supported by the build host, including AVX2
                   and AVX-512 where available. Set to OFF for portable builds.
+  BLD_USE_CONDA_TOOLCHAIN
+                  Use the active Conda C/C++ compiler toolchain (default: OFF).
+                  By default, an active Conda environment only selects Python;
+                  Blender itself is built with a host GCC 14+ toolchain.
   OPTIX_ROOT_DIR  Optional path to an extracted NVIDIA OptiX SDK. The path
                   must contain include/optix.h. OptiX accelerates Cycles
                   rendering only; it does not accelerate mesh operations.
@@ -124,6 +128,15 @@ if [[ -z "${supported_python}" ]]; then
   exit 1
 fi
 
+minimum_gcc_version="$(
+  sed -n 's/.*minimum supported version of GCC is \([0-9][0-9.]*\),.*/\1/p' CMakeLists.txt | sed -n '1p'
+)"
+minimum_gcc_version="${minimum_gcc_version// /}"
+if [[ -z "${minimum_gcc_version}" ]]; then
+  echo "Unable to determine Blender's minimum GCC version." >&2
+  exit 1
+fi
+
 python_version_at_least() {
   local candidate_major="${1%%.*}"
   local candidate_minor="${1#*.}"
@@ -132,6 +145,125 @@ python_version_at_least() {
 
   ((candidate_major > required_major ||
     (candidate_major == required_major && candidate_minor >= required_minor)))
+}
+
+version_at_least() {
+  local candidate="$1"
+  local required="$2"
+  local candidate_major candidate_minor candidate_patch
+  local required_major required_minor required_patch
+
+  IFS=. read -r candidate_major candidate_minor candidate_patch _ <<<"${candidate}"
+  IFS=. read -r required_major required_minor required_patch _ <<<"${required}"
+  candidate_minor="${candidate_minor:-0}"
+  candidate_patch="${candidate_patch:-0}"
+  required_minor="${required_minor:-0}"
+  required_patch="${required_patch:-0}"
+
+  ((10#${candidate_major} > 10#${required_major} ||
+    (10#${candidate_major} == 10#${required_major} && 10#${candidate_minor} > 10#${required_minor}) ||
+    (10#${candidate_major} == 10#${required_major} && 10#${candidate_minor} == 10#${required_minor} &&
+      10#${candidate_patch} >= 10#${required_patch})))
+}
+
+path_is_under() {
+  local path="$1"
+  local parent="$2"
+  local resolved_path resolved_parent
+
+  [[ -n "${path}" && -n "${parent}" ]] || return 1
+  resolved_path="$(readlink -f "${path}" 2>/dev/null || true)"
+  resolved_parent="$(readlink -f "${parent}" 2>/dev/null || true)"
+  [[ -n "${resolved_path}" && -n "${resolved_parent}" &&
+    "${resolved_path}" == "${resolved_parent}"/* ]]
+}
+
+command_path() {
+  command -v "$1" 2>/dev/null || true
+}
+
+is_active_conda_command() {
+  local candidate
+
+  [[ -n "${CONDA_PREFIX:-}" ]] || return 1
+  candidate="$(command_path "$1")"
+  [[ -n "${candidate}" ]] || return 1
+  path_is_under "${candidate}" "${CONDA_PREFIX}"
+}
+
+find_host_command() {
+  local name="$1"
+  local candidate
+
+  while IFS= read -r candidate; do
+    [[ -x "${candidate}" ]] || continue
+    if [[ -z "${CONDA_PREFIX:-}" ]] || ! path_is_under "${candidate}" "${CONDA_PREFIX}"; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done < <(type -aP "${name}" 2>/dev/null | awk '!seen[$0]++')
+
+  return 1
+}
+
+filter_conda_path_list() {
+  local path_list="$1"
+  local filtered=()
+  local entry
+  local resolved_entry resolved_conda_prefix
+
+  [[ -n "${CONDA_PREFIX:-}" ]] || {
+    printf '%s\n' "${path_list}"
+    return
+  }
+
+  resolved_conda_prefix="$(readlink -f "${CONDA_PREFIX}" 2>/dev/null || true)"
+  IFS=: read -ra entries <<<"${path_list}"
+  for entry in "${entries[@]}"; do
+    [[ -n "${entry}" ]] || continue
+    resolved_entry="$(readlink -f "${entry}" 2>/dev/null || true)"
+    if [[ "${resolved_entry}" != "${resolved_conda_prefix}" ]] &&
+      ! path_is_under "${entry}" "${CONDA_PREFIX}"
+    then
+      filtered+=("${entry}")
+    fi
+  done
+
+  local IFS=:
+  printf '%s\n' "${filtered[*]}"
+}
+
+compiler_version() {
+  "$1" -dumpfullversion -dumpversion 2>/dev/null | sed -n '1p'
+}
+
+select_gcc_toolchain() {
+  local min_gcc_version="$1"
+  local min_gcc_major="${min_gcc_version%%.*}"
+  local candidate_major candidate_cc candidate_cxx candidate_version
+
+  for ((candidate_major = min_gcc_major; candidate_major <= 20; candidate_major++)); do
+    candidate_cc="$(find_host_command "gcc-${candidate_major}" || true)"
+    candidate_cxx="$(find_host_command "g++-${candidate_major}" || true)"
+    [[ -n "${candidate_cc}" && -n "${candidate_cxx}" ]] || continue
+    candidate_version="$(compiler_version "${candidate_cc}")"
+    if [[ -n "${candidate_version}" ]] && version_at_least "${candidate_version}" "${min_gcc_version}"; then
+      printf '%s\n%s\n' "${candidate_cc}" "${candidate_cxx}"
+      return 0
+    fi
+  done
+
+  candidate_cc="$(find_host_command gcc || true)"
+  candidate_cxx="$(find_host_command g++ || true)"
+  if [[ -n "${candidate_cc}" && -n "${candidate_cxx}" ]]; then
+    candidate_version="$(compiler_version "${candidate_cc}")"
+    if [[ -n "${candidate_version}" ]] && version_at_least "${candidate_version}" "${min_gcc_version}"; then
+      printf '%s\n%s\n' "${candidate_cc}" "${candidate_cxx}"
+      return 0
+    fi
+  fi
+
+  return 1
 }
 
 python_cmake_args_for() {
@@ -248,6 +380,7 @@ bpy_build_dir="${build_dir_base}_bpy_release"
 release_install_dir="${release_build_dir}/install"
 build_jobs="${NPROCS:-$(nproc)}"
 native_cpu_build="${NATIVE_CPU_BUILD:-ON}"
+use_conda_toolchain="${BLD_USE_CONDA_TOOLCHAIN:-OFF}"
 
 if ! [[ "${build_jobs}" =~ ^[1-9][0-9]*$ ]]; then
   echo "NPROCS must be a positive integer, got: ${build_jobs}" >&2
@@ -263,6 +396,19 @@ case "${native_cpu_build,,}" in
     ;;
   *)
     echo "NATIVE_CPU_BUILD must be ON or OFF, got: ${native_cpu_build}" >&2
+    exit 2
+    ;;
+esac
+
+case "${use_conda_toolchain,,}" in
+  1 | on | true | yes)
+    use_conda_toolchain=true
+    ;;
+  0 | off | false | no)
+    use_conda_toolchain=false
+    ;;
+  *)
+    echo "BLD_USE_CONDA_TOOLCHAIN must be ON or OFF, got: ${use_conda_toolchain}" >&2
     exit 2
     ;;
 esac
@@ -288,12 +434,68 @@ ccache_option=OFF
 if command -v ccache >/dev/null 2>&1; then
   ccache_option=ON
 fi
-cxx_command="${CXX:-c++}"
+c_command="${CC:-}"
+cxx_command="${CXX:-}"
+if [[ "${use_conda_toolchain}" == false && -n "${active_conda_python}" ]]; then
+  if [[ -n "${c_command}" ]] && is_active_conda_command "${c_command}"; then
+    echo "Ignoring active Conda C compiler: $(command_path "${c_command}")"
+    c_command=""
+  fi
+  if [[ -n "${cxx_command}" ]] && is_active_conda_command "${cxx_command}"; then
+    echo "Ignoring active Conda C++ compiler: $(command_path "${cxx_command}")"
+    cxx_command=""
+  fi
+fi
+if [[ -z "${c_command}" || -z "${cxx_command}" ]]; then
+  if ! mapfile -t selected_gcc_toolchain < <(select_gcc_toolchain "${minimum_gcc_version}"); then
+    echo "No host GCC ${minimum_gcc_version}+ toolchain was found." >&2
+    echo "Run ./install_deps.sh, set CC/CXX to a GCC ${minimum_gcc_version}+ pair, or set BLD_USE_CONDA_TOOLCHAIN=ON." >&2
+    exit 1
+  fi
+  c_command="${c_command:-${selected_gcc_toolchain[0]}}"
+  cxx_command="${cxx_command:-${selected_gcc_toolchain[1]}}"
+fi
+c_command="$(command_path "${c_command}")"
+cxx_command="$(command_path "${cxx_command}")"
+if [[ -z "${c_command}" || -z "${cxx_command}" ]]; then
+  echo "Unable to resolve the selected C/C++ compiler paths." >&2
+  exit 1
+fi
+
+build_cflags="${CFLAGS:-}"
+build_cxxflags="${CXXFLAGS:-}"
+if [[ "${use_conda_toolchain}" == false && -n "${active_conda_python}" ]]; then
+  if [[ -n "${build_cflags}" && "${build_cflags}" == *"${CONDA_PREFIX}"* ]]; then
+    echo "Ignoring active Conda CFLAGS for the host compiler"
+    build_cflags=""
+  fi
+  if [[ -n "${build_cxxflags}" && "${build_cxxflags}" == *"${CONDA_PREFIX}"* ]]; then
+    echo "Ignoring active Conda CXXFLAGS for the host compiler"
+    build_cxxflags=""
+  fi
+  if [[ -n "${CMAKE_PREFIX_PATH:-}" ]]; then
+    filtered_cmake_prefix_path="$(filter_conda_path_list "${CMAKE_PREFIX_PATH}")"
+    if [[ "${filtered_cmake_prefix_path}" != "${CMAKE_PREFIX_PATH}" ]]; then
+      echo "Ignoring active Conda CMake prefix paths for the host build"
+      if [[ -n "${filtered_cmake_prefix_path}" ]]; then
+        export CMAKE_PREFIX_PATH="${filtered_cmake_prefix_path}"
+      else
+        unset CMAKE_PREFIX_PATH
+      fi
+    fi
+  fi
+  unset CONDA_BUILD_SYSROOT
+fi
 
 common_cmake_args=(
+  "-DCMAKE_C_COMPILER=${c_command}"
+  "-DCMAKE_CXX_COMPILER=${cxx_command}"
   "-DWITH_COMPILER_CCACHE=${ccache_option}"
   "-DWITH_LIBS_PRECOMPILED=ON"
+  "-DWITH_CYCLES_ONEAPI_BINARIES=OFF"
 )
+echo "Using C compiler: ${c_command} ($(compiler_version "${c_command}"))"
+echo "Using C++ compiler: ${cxx_command} ($(compiler_version "${cxx_command}"))"
 
 # Blender's portable Linux default is x86-64-v2.  This is a local build, so
 # compile Blender and bpy for the actual build host by default.  Keep Blender's
@@ -335,8 +537,8 @@ if [[ "${native_cpu_build}" == true ]]; then
   native_cpu_flags_string="${native_cpu_flags[*]}"
   common_cmake_args+=(
     "-DWITH_COMPILER_SIMD=OFF"
-    "-DCMAKE_C_FLAGS=${CFLAGS:+${CFLAGS} }${native_cpu_flags_string}"
-    "-DCMAKE_CXX_FLAGS=${CXXFLAGS:+${CXXFLAGS} }${native_cpu_flags_string}"
+    "-DCMAKE_C_FLAGS=${build_cflags:+${build_cflags} }${native_cpu_flags_string}"
+    "-DCMAKE_CXX_FLAGS=${build_cxxflags:+${build_cxxflags} }${native_cpu_flags_string}"
   )
   echo "Host-native CPU code generation enabled: ${native_cpu_flags_string}"
   echo "The resulting binaries are intended for this CPU generation."
@@ -345,8 +547,8 @@ else
   # switch works without requiring a clean build directory.
   common_cmake_args+=(
     "-DWITH_COMPILER_SIMD=ON"
-    "-DCMAKE_C_FLAGS=${CFLAGS:-}"
-    "-DCMAKE_CXX_FLAGS=${CXXFLAGS:-}"
+    "-DCMAKE_C_FLAGS=${build_cflags}"
+    "-DCMAKE_CXX_FLAGS=${build_cxxflags}"
   )
 fi
 

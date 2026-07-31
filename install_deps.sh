@@ -56,14 +56,23 @@ if [[ "${install_system}" == true ]]; then
 
   python3 build_files/build_environment/install_linux_packages.py --distro-id debian
 
+  apt_packages=(ccache dpkg-dev)
+  if apt-cache show gcc-14 >/dev/null 2>&1 && apt-cache show g++-14 >/dev/null 2>&1; then
+    apt_packages+=(gcc-14 g++-14)
+  else
+    echo "GCC 14 packages are unavailable from APT." >&2
+    echo "Install GCC 14 or newer before building Blender 5.2." >&2
+    exit 1
+  fi
+
   if (( EUID == 0 )); then
-    apt-get install -y ccache dpkg-dev
+    apt-get install -y "${apt_packages[@]}"
   else
     if ! command -v sudo >/dev/null 2>&1; then
-      echo "sudo is required to install ccache and dpkg-dev." >&2
+      echo "sudo is required to install ${apt_packages[*]}." >&2
       exit 1
     fi
-    sudo apt-get install -y ccache dpkg-dev
+    sudo apt-get install -y "${apt_packages[@]}"
   fi
 fi
 
