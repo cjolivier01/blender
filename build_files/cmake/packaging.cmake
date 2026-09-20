@@ -73,8 +73,43 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(CPACK_PACKAGE_RELOCATABLE "false")
     set(CPACK_RPM_PACKAGE_LICENSE "GPLv2+ and Apache 2.0")
     set(CPACK_RPM_PACKAGE_GROUP "Amusements/Multimedia")
-    set(CPACK_RPM_USER_BINARY_SPECFILE "${CMAKE_SOURCE_DIR}/build_files/package_spec/rpm/blender.spec.in")
+    set(_blender_rpm_spec "${CMAKE_SOURCE_DIR}/build_files/package_spec/rpm/blender.spec.in")
+    if(EXISTS "${_blender_rpm_spec}")
+      set(CPACK_RPM_USER_BINARY_SPECFILE "${_blender_rpm_spec}")
+    endif()
+    unset(_blender_rpm_spec)
   endif()
+
+  # DEB packages.
+  # Keep CPack's default naming scheme.
+  set(CPACK_DEBIAN_PACKAGE_MAINTAINER "${PROJECT_VENDOR}")
+  set(CPACK_DEBIAN_PACKAGE_SECTION "graphics")
+  set(CPACK_DEBIAN_FILE_NAME "DEB-DEFAULT")
+  # The release contains optional NVIDIA and AMD plug-ins. dpkg-shlibdeps
+  # treats their driver libraries as unconditional dependencies, so declare
+  # only the host libraries required by the portable application itself.
+  string(JOIN ", " CPACK_DEBIAN_PACKAGE_DEPENDS
+    "libc6 (>= 2.43)"
+    libgcc-s1
+    libstdc++6
+    libgl1
+    libglx0
+    libice6
+    libncursesw6
+    libopengl0
+    libsm6
+    libtinfo6
+    libuuid1
+    libx11-6
+    libxext6
+    libxfixes3
+    libxi6
+    libxkbcommon0
+    libxt6t64
+  )
+
+  # Keep the portable layout together and out of the system library paths.
+  set(CPACK_PACKAGING_INSTALL_PREFIX "/opt/blender-${MAJOR_VERSION}.${MINOR_VERSION}")
 endif()
 
 # Mac Bundle
@@ -116,7 +151,17 @@ endif()
 set(CPACK_PACKAGE_EXECUTABLES "blender-launcher" "Blender ${MAJOR_VERSION}.${MINOR_VERSION}")
 set(CPACK_CREATE_DESKTOP_LINKS "blender-launcher" "Blender ${MAJOR_VERSION}.${MINOR_VERSION}")
 
+set(CPACK_PROJECT_CONFIG_FILE "${CMAKE_SOURCE_DIR}/build_files/cmake/packaging_project.cmake")
 include(CPack)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_custom_target(package_deb
+    COMMAND "${CMAKE_CPACK_COMMAND}" -G DEB --config "${CPACK_OUTPUT_CONFIG_FILE}" -B "${CMAKE_BINARY_DIR}/release"
+    WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
+    COMMENT "Building DEB package with CPack"
+    VERBATIM
+  )
+endif()
 
 # Target for build_archive.py script, to automatically pass along
 # version, revision, platform, build directory
