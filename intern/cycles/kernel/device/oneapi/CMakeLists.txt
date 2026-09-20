@@ -30,6 +30,11 @@ set(LIB
 
 )
 
+set(CYCLES_ONEAPI_PRECOMPILED_KERNEL "" CACHE FILEPATH
+  "Optional compatible oneAPI kernel to reuse instead of compiling it"
+)
+mark_as_advanced(CYCLES_ONEAPI_PRECOMPILED_KERNEL)
+
 if(WITH_CYCLES_DEVICE_ONEAPI)
   if(WITH_CYCLES_ONEAPI_BINARIES)
     set(cycles_kernel_oneapi_lib_suffix "_aot")
@@ -232,7 +237,26 @@ if(WITH_CYCLES_DEVICE_ONEAPI)
     -g
   )
 
-  if(WIN32)
+  if(CYCLES_ONEAPI_PRECOMPILED_KERNEL)
+    if(WIN32)
+      message(FATAL_ERROR "CYCLES_ONEAPI_PRECOMPILED_KERNEL is only supported on Linux")
+    endif()
+    if(NOT EXISTS "${CYCLES_ONEAPI_PRECOMPILED_KERNEL}")
+      message(FATAL_ERROR
+        "CYCLES_ONEAPI_PRECOMPILED_KERNEL does not exist: "
+        "${CYCLES_ONEAPI_PRECOMPILED_KERNEL}"
+      )
+    endif()
+    add_custom_command(
+      OUTPUT ${cycles_kernel_oneapi_lib}
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CYCLES_ONEAPI_PRECOMPILED_KERNEL}"
+        "${cycles_kernel_oneapi_lib}"
+      DEPENDS "${CYCLES_ONEAPI_PRECOMPILED_KERNEL}"
+      COMMENT "Reusing precompiled Cycles oneAPI kernel"
+      VERBATIM
+    )
+  elseif(WIN32)
     list(APPEND sycl_compiler_flags_Debug
       -D_DEBUG
       -nostdlib
